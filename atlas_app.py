@@ -1284,6 +1284,25 @@ def drawdown_series(equity: pd.Series) -> pd.Series:
     return equity / peak - 1.0
 
 
+def build_risk_df(net: pd.Series, bench: pd.Series, net_equity: pd.Series, avg_turn: float) -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Metric": "CAGR", "Value": cagr(net_equity), "Format": "pct"},
+        {"Metric": "Annual return", "Value": annualized_return(net), "Format": "pct"},
+        {"Metric": "Annual volatility", "Value": annualized_vol(net), "Format": "pct"},
+        {"Metric": "Max drawdown", "Value": max_drawdown(net_equity), "Format": "pct"},
+        {"Metric": "Sharpe", "Value": sharpe_ratio(net), "Format": "num"},
+        {"Metric": "Sortino", "Value": sortino_ratio(net), "Format": "num"},
+        {"Metric": "Beta", "Value": beta(net, bench), "Format": "num"},
+        {"Metric": "Tracking error", "Value": tracking_error(net, bench), "Format": "pct"},
+        {"Metric": "Information ratio", "Value": info_ratio(net, bench), "Format": "num"},
+        {"Metric": "Average turnover", "Value": avg_turn, "Format": "num"},
+    ])
+
+
+def fmt_risk_row(row: pd.Series) -> str:
+    return fmt_pct(row["Value"]) if row["Format"] == "pct" else fmt_num(row["Value"])
+
+
 # =============================================================================
 # STREAMLIT APP
 # =============================================================================
@@ -1294,103 +1313,118 @@ with st.sidebar:
     advanced = mode == "Advanced"
     apply_mode_theme(advanced)
 
-                st.subheader("Settings")
-                profile = st.selectbox("Profile", ["Balanced", "Conservative", "Aggressive", "Custom"], index=0)
-                
-                st.markdown("**Dates**")
-                start = st.text_input("Start", value=DEFAULT_START)
-                end_in = st.text_input("End (optional)", value="")
-                end = None if end_in.strip() == "" else end_in.strip()
-                model_split_in = st.text_input(
-                "Model IS/OOS split date",
-                value=DEFAULT_MODEL_SPLIT,
-                help="Full factor model validation split. The selected strategy is evaluated before and after this date.",
-                )
-                
-                st.markdown("**Portfolio**")
-                rebalance_label = st.selectbox(
-                "Rebalance",
-                ["Monthly", "Quarterly"] if beginner else ["Monthly", "Quarterly", "Weekly"],
-                index=0,
-                )
-                rebalance = {"Monthly": "ME", "Quarterly": "QE", "Weekly": "W"}[rebalance_label]
-                top_n = st.slider("Holdings", 10 if beginner else 5, 50, DEFAULT_TOP_N)
-                weighting_label = st.selectbox("Weighting", ["Equal weight", "Risk parity", "Min variance"], index=0)
-                weighting = {"Equal weight": "equal", "Risk parity": "risk_parity", "Min variance": "min_variance"}[weighting_label]
-                tc = st.number_input("Trading costs (bps / 100% turnover)", 0.0, 200.0,
-                                     float(DEFAULT_TC_BPS_PER_100_TURNOVER), 1.0)
-                
-                st.markdown("**Benchmark**")
-                benchmark = st.text_input("Ticker", value=DEFAULT_BENCHMARK)
-                
-                st.markdown("**VIX**")
-                vix_ticker = st.text_input("VIX ticker", value=DEFAULT_VIX_TICKER)
-                if beginner:
-                vix_smooth = DEFAULT_VIX_SMOOTH_DAYS
-                low_q = DEFAULT_LOW_Q
-                high_q = DEFAULT_HIGH_Q
-                use_wf = True
-                split_date_in = None
-                else:
-                vix_smooth = st.number_input("Smoothing (days)", 5, 252, int(DEFAULT_VIX_SMOOTH_DAYS), 1)
-                low_q = st.slider("Low quantile", 0.05, 0.49, float(DEFAULT_LOW_Q), 0.01)
-                high_q = st.slider("High quantile", 0.51, 0.95, float(DEFAULT_HIGH_Q), 0.01)
-                use_wf = st.toggle("Walk-forward VIX thresholds", value=True,
-                help="Compute VIX regime thresholds from in-sample data only, "
-                "then apply to the full period. Prevents look-ahead bias.")
-                split_date_in = st.text_input("In-sample / OOS split date", value="2021-01-01",
-                help="Thresholds are estimated on data before this date.") if use_wf else None
-                
-                st.markdown("**Lookback windows**")
-                if advanced:
-                mom_lb = st.number_input("Momentum lookback (days)", 63, 504, int(DEFAULT_MOM_LB), 21)
-                vol_lb = st.number_input("Volatility lookback (days)", 63, 504, int(DEFAULT_VOL_LB), 21)
-                else:
-                mom_lb = DEFAULT_MOM_LB
-                vol_lb = DEFAULT_VOL_LB
-                
-                st.markdown("**Weights**")
-                auto_norm = st.toggle("Normalize weights", value=True)
-                w = dict(DEFAULT_WEIGHTS)
-                if profile == "Conservative":
-                    w = {"value_pe": 0.15, "profit_roe": 0.15, "growth_rev": 0.15,
-                         "risk_vol": 0.30, "risk_de": 0.25}
-                elif profile == "Aggressive":
-                    w = {"value_pe": 0.15, "profit_roe": 0.30, "growth_rev": 0.30,
-                         "risk_vol": 0.15, "risk_de": 0.10}
-                if profile == "Custom" or advanced:
-                    w["value_pe"] = st.slider("Value (P/E)", 0.0, 1.0, float(w["value_pe"]), 0.05)
-                    w["profit_roe"] = st.slider("Profit (ROE)", 0.0, 1.0, float(w["profit_roe"]), 0.05)
-                    w["growth_rev"] = st.slider("Growth (rev)", 0.0, 1.0, float(w["growth_rev"]), 0.05)
-                    w["risk_vol"] = st.slider("Risk (vol)", 0.0, 1.0, float(w["risk_vol"]), 0.05)
-                    w["risk_de"] = st.slider("Risk (debt)", 0.0, 1.0, float(w["risk_de"]), 0.05)
-                weights = normalize_weights(w) if auto_norm else w
-                st.caption(f"Weight sum: {sum(weights.values()):.2f}")
-                
-                st.markdown("**Universe**")
-                universe_source = st.selectbox(
-                "Universe source",
-                ["Default sample", "Current S&P 500 (Wikipedia)", "Custom tickers"],
-                index=0,
-                )
-                sp500_meta = pd.DataFrame()
-                sp500_error = None
-                if universe_source == "Current S&P 500 (Wikipedia)":
-                try:
-                    sp500_meta = fetch_sp500_constituents()
-                    tickers = sp500_meta["ticker"].tolist()
-                    st.caption(f"Loaded {len(tickers)} current S&P 500 constituents.")
-                except Exception as exc:
-                    sp500_error = str(exc)
-                    st.warning("Could not load Wikipedia constituents; using default sample.")
-                    tickers = DEFAULT_TICKERS
-                elif universe_source == "Custom tickers":
-                tickers_text = st.text_area("Tickers", ", ".join(DEFAULT_TICKERS), height=120)
-                tickers = clean_ticker_list(tickers_text)
-                else:
-                tickers = DEFAULT_TICKERS
-                st.divider()
-                run = st.button("Run", type="primary")
+    st.subheader("Settings")
+    profile = st.selectbox("Profile", ["Balanced", "Conservative", "Aggressive", "Custom"], index=0)
+
+    st.markdown("**Dates**")
+    start = st.text_input("Start", value=DEFAULT_START)
+    end_in = st.text_input("End (optional)", value="")
+    end = None if end_in.strip() == "" else end_in.strip()
+    model_split_in = st.text_input(
+        "Model IS/OOS split date",
+        value=DEFAULT_MODEL_SPLIT,
+        help="Full factor model validation split. The selected strategy is evaluated before and after this date.",
+    )
+
+    st.markdown("**Portfolio**")
+    rebalance_label = st.selectbox(
+        "Rebalance",
+        ["Monthly", "Quarterly"] if beginner else ["Monthly", "Quarterly", "Weekly"],
+        index=0,
+    )
+    rebalance = {"Monthly": "ME", "Quarterly": "QE", "Weekly": "W"}[rebalance_label]
+    top_n = st.slider("Holdings", 10 if beginner else 5, 50, DEFAULT_TOP_N)
+    weighting_label = st.selectbox("Weighting", ["Equal weight", "Risk parity", "Min variance"], index=0)
+    weighting = {"Equal weight": "equal", "Risk parity": "risk_parity", "Min variance": "min_variance"}[weighting_label]
+    tc = st.number_input(
+        "Trading costs (bps / 100% turnover)",
+        0.0,
+        200.0,
+        float(DEFAULT_TC_BPS_PER_100_TURNOVER),
+        1.0,
+    )
+
+    st.markdown("**Benchmark**")
+    benchmark = st.text_input("Ticker", value=DEFAULT_BENCHMARK)
+
+    st.markdown("**VIX**")
+    vix_ticker = st.text_input("VIX ticker", value=DEFAULT_VIX_TICKER)
+    if beginner:
+        vix_smooth = DEFAULT_VIX_SMOOTH_DAYS
+        low_q = DEFAULT_LOW_Q
+        high_q = DEFAULT_HIGH_Q
+        use_wf = True
+        split_date_in = None
+    else:
+        vix_smooth = st.number_input("Smoothing (days)", 5, 252, int(DEFAULT_VIX_SMOOTH_DAYS), 1)
+        low_q = st.slider("Low quantile", 0.05, 0.49, float(DEFAULT_LOW_Q), 0.01)
+        high_q = st.slider("High quantile", 0.51, 0.95, float(DEFAULT_HIGH_Q), 0.01)
+        use_wf = st.toggle(
+            "Walk-forward VIX thresholds",
+            value=True,
+            help=(
+                "Compute VIX regime thresholds from in-sample data only, "
+                "then apply to the full period. Prevents look-ahead bias."
+            ),
+        )
+        split_date_in = (
+            st.text_input(
+                "In-sample / OOS split date",
+                value="2021-01-01",
+                help="Thresholds are estimated on data before this date.",
+            )
+            if use_wf
+            else None
+        )
+
+    st.markdown("**Lookback windows**")
+    if advanced:
+        mom_lb = st.number_input("Momentum lookback (days)", 63, 504, int(DEFAULT_MOM_LB), 21)
+        vol_lb = st.number_input("Volatility lookback (days)", 63, 504, int(DEFAULT_VOL_LB), 21)
+    else:
+        mom_lb = DEFAULT_MOM_LB
+        vol_lb = DEFAULT_VOL_LB
+
+    st.markdown("**Weights**")
+    auto_norm = st.toggle("Normalize weights", value=True)
+    w = dict(DEFAULT_WEIGHTS)
+    if profile == "Conservative":
+        w = {"value_pe": 0.15, "profit_roe": 0.15, "growth_rev": 0.15, "risk_vol": 0.30, "risk_de": 0.25}
+    elif profile == "Aggressive":
+        w = {"value_pe": 0.15, "profit_roe": 0.30, "growth_rev": 0.30, "risk_vol": 0.15, "risk_de": 0.10}
+    if profile == "Custom" or advanced:
+        w["value_pe"] = st.slider("Value (P/E)", 0.0, 1.0, float(w["value_pe"]), 0.05)
+        w["profit_roe"] = st.slider("Profit (ROE)", 0.0, 1.0, float(w["profit_roe"]), 0.05)
+        w["growth_rev"] = st.slider("Growth (rev)", 0.0, 1.0, float(w["growth_rev"]), 0.05)
+        w["risk_vol"] = st.slider("Risk (vol)", 0.0, 1.0, float(w["risk_vol"]), 0.05)
+        w["risk_de"] = st.slider("Risk (debt)", 0.0, 1.0, float(w["risk_de"]), 0.05)
+    weights = normalize_weights(w) if auto_norm else w
+    st.caption(f"Weight sum: {sum(weights.values()):.2f}")
+
+    st.markdown("**Universe**")
+    universe_source = st.selectbox(
+        "Universe source",
+        ["Default sample", "Current S&P 500 (Wikipedia)", "Custom tickers"],
+        index=0,
+    )
+    sp500_meta = pd.DataFrame()
+    sp500_error = None
+    if universe_source == "Current S&P 500 (Wikipedia)":
+        try:
+            sp500_meta = fetch_sp500_constituents()
+            tickers = sp500_meta["ticker"].tolist()
+            st.caption(f"Loaded {len(tickers)} current S&P 500 constituents.")
+        except Exception as exc:
+            sp500_error = str(exc)
+            st.warning("Could not load Wikipedia constituents; using default sample.")
+            tickers = DEFAULT_TICKERS
+    elif universe_source == "Custom tickers":
+        tickers_text = st.text_area("Tickers", ", ".join(DEFAULT_TICKERS), height=120)
+        tickers = clean_ticker_list(tickers_text)
+    else:
+        tickers = DEFAULT_TICKERS
+    st.divider()
+    run = st.button("Run", type="primary")
 
 st.title("Atlas")
 st.caption("A rules-based stock ranking model with a backtest, factor diagnostics, and statistical tests.")
@@ -1500,6 +1534,10 @@ if out.gross.empty or out.net.empty:
 eq = equity_df(out.gross, out.net, out.bench, bench_name=benchmark)
 net_equity = eq["Portfolio (Net)"]
 model_split = coerce_split_date(model_split_in, eq.index)
+momentum_all, vol_all = compute_price_factors(prices, mom_lb=int(mom_lb), vol_lb=int(vol_lb))
+valid_dates = [d for d in out.rebal_dates if d in momentum_all.index and d in vol_all.index]
+valid_dates = [d for d in valid_dates if not momentum_all.loc[d].dropna().empty]
+risk_df = build_risk_df(out.net, out.bench, net_equity, out.avg_turn)
 
 s1, s2, s3, s4, s5 = st.columns(5)
 s1.metric("Universe", f"{len(prices.columns)}")
@@ -1512,48 +1550,60 @@ tab_overview, tab_holdings, tab_regimes, tab_risk, tab_stats, tab_diagnostics, t
     ["Overview", "Holdings", "VIX", "Risk", "Stats", "Diagnostics", "Validation", "Construction", "Downloads", "Method", "Factor Engine"]
 )
 
-if not valid_dates:
-    st.warning("Not enough rebalance dates to display holdings.")
-else:
-    chosen = st.select_slider(
-        "Rebalance date",
-        options=valid_dates,
-        value=valid_dates[-1],
-        format_func=lambda d: safe_date_str(d),
+with tab_overview:
+    st.subheader("Equity curve")
+    st.line_chart(eq)
+    st.subheader("Summary")
+    st.dataframe(
+        risk_df.assign(Display=risk_df.apply(fmt_risk_row, axis=1))[["Metric", "Display"]].rename(columns={"Display": "Value"}),
+        use_container_width=True,
+        hide_index=True,
     )
 
-    scores_full = make_scores_pit(
-        date=chosen,
-        momentum_row=momentum_all.loc[chosen],
-        vol_row=vol_all.loc[chosen],
-        pit_fund_matrix=pit_fund_matrix,
-        weights=weights,
-    ).sort_values(["score", "mom_z"], ascending=False)
 
-    chosen_picks = scores_full.head(int(top_n)).index.tolist()
+with tab_holdings:
+    if not valid_dates:
+        st.warning("Not enough rebalance dates to display holdings.")
+    else:
+        chosen = st.select_slider(
+            "Rebalance date",
+            options=valid_dates,
+            value=valid_dates[-1],
+            format_func=lambda d: safe_date_str(d),
+        )
 
-    chosen_weights = portfolio_weights(
-        weighting,
-        chosen_picks,
-        vol_all.loc[chosen],
-        prices.pct_change(),
-        chosen,
-        int(vol_lb),
-    )
+        scores_full = make_scores_pit(
+            date=chosen,
+            momentum_row=momentum_all.loc[chosen],
+            vol_row=vol_all.loc[chosen],
+            pit_fund_matrix=pit_fund_matrix,
+            weights=weights,
+        ).sort_values(["score", "mom_z"], ascending=False)
 
-    cols = [
-        "score",
-        "value_pe", "profit_roe", "growth_rev", "risk_vol", "risk_de", "mom_12m",
-        "z_value_pe", "z_profit_roe", "z_growth_rev", "z_risk_vol", "z_risk_de", "z_mom_12m",
-    ]
+        chosen_picks = scores_full.head(int(top_n)).index.tolist()
 
-    display_scores = scores_full.head(int(top_n))[cols].copy()
-    display_scores.insert(0, "weight", chosen_weights.reindex(display_scores.index))
+        chosen_weights = portfolio_weights(
+            weighting,
+            chosen_picks,
+            vol_all.loc[chosen],
+            prices.pct_change(),
+            chosen,
+            int(vol_lb),
+        )
 
-    st.dataframe(display_scores, use_container_width=True, height=560)
+        cols = [
+            "score",
+            "value_pe", "profit_roe", "growth_rev", "risk_vol", "risk_de", "mom_12m",
+            "z_value_pe", "z_profit_roe", "z_growth_rev", "z_risk_vol", "z_risk_de", "z_mom_12m",
+        ]
 
-    with st.expander("Change log"):
-        st.dataframe(out.holdings_changes, use_container_width=True, height=360)
+        display_scores = scores_full.head(int(top_n))[cols].copy()
+        display_scores.insert(0, "weight", chosen_weights.reindex(display_scores.index))
+
+        st.dataframe(display_scores, use_container_width=True, height=560)
+
+        with st.expander("Change log"):
+            st.dataframe(out.holdings_changes, use_container_width=True, height=360)
 
 
 with tab_regimes:
@@ -1638,6 +1688,8 @@ with tab_regimes:
         )
 
 
+with tab_risk:
+    st.subheader("Risk metrics")
     risk_df["Display"] = risk_df.apply(fmt_risk_row, axis=1)
     st.dataframe(
         risk_df[["Metric", "Display"]].rename(columns={"Display": "Value"}),
